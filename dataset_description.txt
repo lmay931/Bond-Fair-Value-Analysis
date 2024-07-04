@@ -1,0 +1,57 @@
+	The dataset contains existing AUD Floating Rate Notes (FRNs) that are either active as of today, or were active at one point between 1st Jan 2017 and today.
+	This dataset contains static information about each FRN.
+
+	id - security identifier as used by our data provider
+	id_isin - a widely used security identifier
+	issuer - Bond issuer
+	security_name - security name
+	flt_spread - the issue margin of the FRN
+	final_maturity - Final legal maturity of the FRN
+	first_call_dt_issuance - First call date as of issuance (most FRNs are called on their first call date)
+	issue_dt - date the bond was issued on
+	amt_issued - amount issued (AUD)
+	cntry_issue_iso - country where issuer was incorporated
+	cntry_of_domicile - country where issuer's senior management is located
+	is_kangaroo - Boolean flag indicating if the issuer is non-Australian
+	is_subordinated - Boolean flag indicating if the FRN is subordinated
+	payment_rank - where the bond sits in the issuer's capital structure
+	is_covered - Boolean flag indicating if the FRN is a covered bond
+	basel_iii_designation - Indication of the FRN being a Basel 3 Tier 2 security
+	bond_to_eqy_ticker - the identifier of the issuer, or its closest parent company if issuer does not publish its financial reports
+	exch_code - the exchange on which the bond is traded, note that a bond may trade over the counter
+	cpn_freq - frequency of coupon payments
+	reset_idx - the benchmark index used for the periodic coupon resets
+	mty_typ - maturity type of the bond
+	is_cd - is the bond a certificate of deposit
+	step_up_down_provision - indicates if the coupon can be changed outside the periodic resets over reset_idx, eg over tax events
+	bics_level_1_sector_name - industry classification of issuer
+	bics_level_2_industry_group_name - industry classification of issuer
+	bail_in_bond_designation - indicates whether regulators may write off the note and enforce losses on note holders when the issuer is under stress 
+	extract_time - UTC time at which this dataset was extracted from data provider
+
+
+snapshot_data.csv
+
+	This dataset contains fields that can change over time. A snapshot of these fields as of extract_time is provided in this dataset.
+
+	id - security identifier as used by our data provider
+	rtg_sp_lt_lc_issuer_credit - S&P Issuer credit rating when issuing in local currency
+	rtg_sp_lt_fc_issuer_credit - S&P Issuer credit rating when issuing in foreign currency
+	rtg_sp - S&P Issue rating
+	rtg_moody - Moody's issue rating
+	rtg_fitch - Fitch issue rating
+	nxt_call_dt - Next call date of the FRN (if applicable)
+	amt_outstanding - amount of bond (AUD) still outstanding (a portion may have been repaid early)
+	int_acc - interest accrued on the bond
+	disc_mrgn_mid - the mid trading margin the FRN is currently trading at
+	extract_time - UTC time at which this dataset was extracted from data provider
+
+
+historic_data.csv
+
+	This dataset contains historic data. These are end-of-day figures.
+
+	id - security identifier as used by our data provider
+	date - date 
+	disc_mrgn_mid - the historic (end-of-day) mid trading margin of the FRN 
+	extract_time - UTC time at which this dataset was extracted from data provider

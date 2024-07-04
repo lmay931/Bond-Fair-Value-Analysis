@@ -1,0 +1,325 @@
+---
+title: "Bond Fair Value Analysis"
+author: "Lawrence May"
+date: "2024-06-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+###
+In this project I am using price data on Floating Rate Notes to build a model the fair value of primary bond issues.I start by doing some exploratory data analysis to get a better understanding of the data set, clean the dataset and remove outliers and do some feature engineering to make features more useful. I then fit a couple of different models, from linear regression to regularised regression and some tree based models. I will demonstrate that an XGboost regressor best fits the dataset, with a RMSE of around 27bps.
+
+### Reading in the data
+```{r}
+suppressMessages(library(tidyverse))
+suppressMessages(library(ggplot2))
+suppressMessages(library(dplyr))
+suppressMessages(library(caret))
+suppressMessages(library(glmnet))
+suppressMessages(library(xgboost))
+
+historic_data <- read_csv("historic_data.csv", show_col_types = FALSE) %>% select(-extract_time) #dropping extract_time, irrelevant
+snapshot_data <- read_csv("snapshot_data.csv", show_col_types = FALSE) %>% select(-c(extract_time, nxt_call_dt)) #also dropping nxt_call_dt since i merge with static_data and this already has the column
+static_data<- read_csv("static_data.csv", show_col_types = FALSE) %>% select(-extract_time)
+
+print(paste("Num. obs. Snapshot data:", n_distinct(snapshot_data$id)))
+print(paste("Num. obs. Historic data:", n_distinct(historic_data$id)))
+print(paste("Num. obs. Static data:", n_distinct(static_data$id)))
+```
+Looks like historic data is missing some ISINs. Given that flt_spread and disc_mrgn_mid are some of the most important variables,
+I will quickly check their quality/ completeness.
+
+### EDA
+```{r}
+sum(is.na(static_data$flt_spread)) #counting NAs
+sum(is.na(snapshot_data$disc_mrgn_mid)) # 256 isins missing current disc_mrgn_mid
+```
+To get more information on these NA's, I will merge static data and snapshot data
+```{r}
+static_data <- merge(static_data,snapshot_data,by="id")
+static_data[order(static_data$final_maturity),] %>% head()
+```
+It appears that these NAs occur due to some of the bonds already having matured. Since this means that we don't have any information about our response variable, disc_mrgn_mid with these issues I will remove them from the data set for now. At a later stage, I might look at whether we use the information in historic_data to get a value for disc_mrgn_mid for them before they matured. This would of course not be ideal, as these likely depend on present market conditions which may have changed since they have matured. However, comparing historic disc_mrgn_mid with current ones for issues that haven't yet matured would give an indication on whether this approach would be feasible.
+```{r}
+#removing all NA values for disc_mrgn_mid. This should remove all already matured issues
+static_data <- static_data[complete.cases(static_data$disc_mrgn_mid), ]
+# Plot spread at issuance vs current mkt spread
+ggplot(static_data, aes(x = flt_spread, y = disc_mrgn_mid)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Spread at Issuance vs Traded Spread",
+       x = "Spread at Issuance",
+       y = "Traded Spread")
+```
+We notice a few outliers here, need to investigate what is going on here/ check if faulty data.
+```{r}
+static_data[order(-static_data$disc_mrgn_mid),] %>% head()
+```
+Both of these outliers trading at a 87% and 12% margins, compared to around 5% and below were the nearest other issues are trading. This clearly does not look right. Both were issued by "AXSESSTODAY" which, according to a quick Google search, has been put into administration/ would have been at default risk at the time. Given that Coolabah's investment strategy generally focuses on high-quality issues, I will exclude these two data points as they would likely skew the model.
+```{r}
+static_data[order(static_data$disc_mrgn_mid),] %>% head()
+```
+Another strange looking data point is isin "AU0000TTSHA8" which is trading at 125bps below the risk free benchmark rate, which seems odd for a corporate bond. This could either be due to the maturity date being only days away and this somehow messing with the calculation, or a data error. Either way, it does not look right and I will remove it so it doesn't distort the model.
+```{r}
+static_data <- static_data %>%
+  filter(!(id_isin %in% c('AU3FN0029096', 'AU0000017717', 'AU0000TTSHA8'))) #excluding the 3 isins
+
+ggplot(static_data, aes(x = flt_spread, y = disc_mrgn_mid)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) + # adding a trendline
+  labs(title = "Spread at Issuance vs Traded Spread",
+       x = "Spread at Issuance",
+       y = "Traded Spread")
+```
+Looking at the plot, we can see the spreads more or less resemble a straight line, which is what we would theoretically expect. Bond issuers want to pay as little interest as possible, therefore we would expect them to price their bonds at a level that closely resembles the market conditions.
+
+However, we notice that, on average, the traded spread appears to be slightly lower than the spread at issuance. This perhaps also makes sense, as bond issuers will want to make sure that their new issues are fully subscribed for and therefore might sell them just slightly below market price (similar to an IPO for equities).
+
+### Mid trading margin over time
+```{r}
+set.seed(1) #reproducability
+flt_spread_data <- static_data %>% select(c(id, flt_spread)) %>% mutate(date= as.Date(c("2017-01-23"))) # setting "2017-01-23" as the issue date for simplicity so looks nice on the plot
+random_ids <- sample(unique(historic_data$id), 10) # taking 10 random issues to keep visibility
+
+# Subset the data for the 10 randomly selected IDs
+subset_historic_data <- historic_data[historic_data$id %in% random_ids, ]
+subset_flt_spread_data <- flt_spread_data[flt_spread_data$id %in% random_ids, ]
+
+p <- ggplot(subset_historic_data, aes(x = date)) +
+  geom_line(aes(y = disc_mrgn_mid, color = id)) +
+  labs(title = "Spread above 3m BBSW at issuance vs in secondary trading",
+       x = "Date",
+       y = "Spread") 
+
+p + geom_point(data = subset_flt_spread_data, size=4, aes(x = date, y = flt_spread, color = id), show.legend = FALSE)
+```
+This plot shows bonds' spread above 3m BBSW at issuance (thick dots) compared to when traded in secondary markets. It appears that in most, though not all, case to confirm the earlier insight that, on average, spreads appear to decrease a little once a bond starts to trade in the secondary market. I will now look at this more quantitatively:
+```{r}
+flt_spread_data <- static_data %>% select(c(id, flt_spread))
+
+summary_stats <- historic_data %>%
+  group_by(id) %>%
+  summarise(mean_spread = mean(disc_mrgn_mid), # calculating mean and sd for disc_mrgn_mid
+            sd_spread = sd(disc_mrgn_mid))
+
+spread_diff <- flt_spread_data %>%
+  inner_join(summary_stats, by = "id") %>%
+  mutate(diff_flt_mean_traded_spread = flt_spread - mean_spread) # calculating difference between spread at issuance and secondary trading
+
+# Compute the largest difference between 'A' and 'flt' for each 'id'
+largest_diff_flt_spread <- historic_data %>%
+  inner_join(flt_spread_data, by = "id") %>%
+  group_by(id) %>%
+  summarise(largest_diff_spread = max(flt_spread - disc_mrgn_mid))
+spread_diff %>% head()
+largest_diff_flt_spread %>% head()
+```
+```{r}
+mean_diff_flt_mean <- mean(spread_diff$diff_flt_mean_traded_spread, na.rm = TRUE)
+mean_largest_diff <- mean(largest_diff_flt_spread$largest_diff_spread, na.rm = TRUE)
+paste("Average difference between traded spread and issue spread:", mean_diff_flt_mean)
+paste("Average largest difference traded spread and issue spread:", mean_largest_diff)
+```
+The above results indicate that, on average, the mean traded spread is 15 bps below the spread at issuance for all bonds. The average largest difference recorded in the data set between spread at issuance and traded spreads is quite a bit higher, at 36bps. This indicates that buying bond directly at issuance and speculating on a fall in spreads once bonds start being traded in secondary markets appears to be a profitable strategy, on average.
+
+Metrics such as the above (e.g. mean traded spread, sd of traded spread, average difference between traded spread and issue spread) could be calculated for each bond issuer or each type of bond and included as features into the models. I will leave this to a later stage for now.
+
+### Creating numerical credit ranking variable
+Converting the credit rating variables into numerical variables so the model understands their relative ranking:
+```{r}
+table(static_data$rtg_sp)
+table(static_data$rtg_sp_lt_fc_issuer_credit)
+table(static_data$rtg_sp_lt_lc_issuer_credit)
+table(static_data$rtg_fitch)
+table(static_data$rtg_moody)
+```
+
+Some of these ratings look a bit suspect. For example, "A- * - ", "AA- * - ", "P-1" and "BBB*-"appear to be errors. Looking at the official S&Ps ratings, these are not official ratings of S&Ps. Instead, I suspect they are meant to be A-, AA- and BBB-, respectively. I will re-categorise them accordingly and change them to a numerical score to ease computation. Giovanni Ferri's approach to this seems like a good idea that I will follow: https://www.researchgate.net/figure/Moodys-and-S-P-alphanumeric-ratings-conversion-into-numeric-values_tbl1_23722339
+```{r}
+# Define a function to convert credit ratings to numerical values
+convert_rating_to_numeric <- function(credit_rating) {
+  numerical_rtg <- case_when(
+    credit_rating %in% c("AAA", "Aaa") ~ 100,
+    credit_rating %in% c("AA+","Aa1") ~ 95,
+    credit_rating %in% c("AA", 'Aa2') ~ 90,
+    credit_rating %in% c("AA-", 'AA- *-', "AA-u", 'Aa3') ~ 85,
+    credit_rating %in% c("A+", "A1") ~ 80,
+    credit_rating %in% c("A", "A2", "A2 *-") ~ 75,
+    credit_rating %in% c("A-", 'A- *-', "A-1+", "A-1", 'A3') ~ 70,
+    credit_rating %in% c("BBB+", "BBB+ *-", "Baa1") ~ 65,
+    credit_rating %in% c("BBB", "BBBu", "BBB *-", "Baa2") ~ 60,
+    credit_rating %in% c("BBB-", "Baa3") ~ 55,
+    credit_rating %in% c("BB+", "Ba1") ~ 50,
+    credit_rating %in% c("BB", "Ba2") ~ 45,
+    credit_rating %in% c("BB-", "Ba3") ~ 40,
+    credit_rating %in% c("B+", "B1") ~ 35,
+    TRUE ~ NA_real_  # set everything else as NA
+  )
+  return(numerical_rtg)
+}
+
+#applying the new function to the different ratings
+static_data <- static_data %>%
+  mutate(rtg_sp_num = convert_rating_to_numeric(rtg_sp),
+         rtg_fitch_num = convert_rating_to_numeric(rtg_fitch),
+         rtg_moody_num = convert_rating_to_numeric(rtg_moody),
+         rtg_sp_lt_lc_issuer_credit_num = convert_rating_to_numeric(rtg_sp_lt_lc_issuer_credit),
+         rtg_sp_lt_fc_issuer_credit_num = convert_rating_to_numeric(rtg_sp_lt_fc_issuer_credit)) %>% 
+  mutate(avg_num_rtg = rowMeans(select(., c("rtg_sp_num", "rtg_fitch_num", "rtg_moody_num", "rtg_sp_lt_lc_issuer_credit_num",  # creating average score
+       "rtg_sp_lt_fc_issuer_credit_num")), na.rm = TRUE)) %>% 
+  select(-c(rtg_sp, rtg_fitch, rtg_moody, rtg_sp_lt_lc_issuer_credit, rtg_sp_lt_fc_issuer_credit)) # removing factor ratings scores
+
+static_data$cpn_freq <- as.factor(static_data$cpn_freq) #coupon frequency needs to be interpreted as a factor and not a number to make sense
+```
+The above converts the categorical ratings into numerical ratings. Avg_num_rtg averages all 5 numerical ratings into 1 score. If there is no rating, it will be set to NA. This should help with reducing the amount of missing variables. These are generally excluded in a linear model, so we want to try reduce the amount of columns with NAs.
+```{r}
+sum(is.na(static_data$avg_num_rtg))
+```
+
+### Model Selection
+Overall, this problem looks like a relatively straight-forward regression problem, we have a number of categorical and numerical variables and a numerical response variable (FV). As a start, I will fit a simple linear regression model with variables that I would intuitively think are important here. I will then use a more automated model selection process to compare. 
+
+### Preparing the data set/ splitting into train-test sets
+```{r}
+static_data_reduced <- static_data %>% select(-c(rtg_sp_num, rtg_fitch_num, rtg_moody_num, rtg_sp_lt_lc_issuer_credit_num, rtg_sp_lt_fc_issuer_credit_num, bond_to_eqy_ticker, id, id_isin, issuer, security_name, basel_iii_designation, first_call_dt_issuance, bail_in_bond_designation)) %>% na.omit() # removing features that would not make sense (e.g names, isins) and ones with too much missing data to be useful (basel_iii, first_call_dt_issuance).
+
+index <- sample(nrow(static_data_reduced), size = 0.8 * nrow(static_data_reduced)) # splitting the data into 80% training, 20% test set so we have an out-of-sample set to get a realistic estimate of model performance later on
+
+# Split the data into train and test sets
+static_data_train <- static_data_reduced[index, ]
+static_data_test <- static_data_reduced[-index, ]
+y_train <- static_data_reduced$disc_mrgn_mid[index]
+y_test <- static_data_reduced$disc_mrgn_mid[-index]
+```
+
+
+### Linear Regression Model
+```{r}
+X <- static_data_train %>% select(-c( cntry_issue_iso, cntry_of_domicile, exch_code, bics_level_1_sector_name, bics_level_2_industry_group_name, amt_issued, amt_outstanding, reset_idx, step_up_down_provision, is_cd, is_covered, int_acc)) # using features that I would intuitively think make sense for an initial model
+
+model <- lm(disc_mrgn_mid~.,data=X)
+summary(model)
+```
+This looks promising. Most variables appear to be highly statistically significant, in particular flt_spread and avg_num_rtg as expected. I will now go through a more systematic variable selection process. To ensure an unbiased estimate of which explanatory variables to include the best model, comparing all possible models through cross-validation is generally the best solution. Due to the large number of possible variables, a penalty driven variable selection process using AIC or Lasso regression seems like the most feasible option. This helps mitigate overfitting as it will penalise including more variables into the model.
+
+### Lasso Regression Model
+
+However, even Lasso is not a perfect way of selecting features. Therefore, I am going to exclude ones that either I know for sure are not going to be useful such as id, names etc that have no predictive information in them, or ones that have too many missing data points to be useful such as basel_iii_designation, first_call_dt_issuance and bail_in_bond_designation.
+```{r}
+X_train <- static_data_train %>% select(-disc_mrgn_mid) %>% data.matrix() #data needs to be in matrix form for lasso, xgb
+
+#k-fold cross-validation to find optimal lambda value
+cv_model <- cv.glmnet(X_train, y_train, alpha = 1)
+
+#find optimal lambda penalty value that minimizes test MSE
+best_lambda <- cv_model$lambda.min
+paste("Best lambda: ", best_lambda)
+paste("Lowest train RMSE: ", sqrt(min(cv_model$cvm)))
+
+#produce plot of test MSE by lambda value
+plot(cv_model)
+```
+```{r}
+best_model_lasso <- glmnet(X_train, y_train, alpha = 1, lambda = best_lambda)
+coef(best_model_lasso)
+```
+Most of the features deemed important by Lasso regression were also ones that I considered important, such as flt_spread, final_maturity and avg_num_rtg which is assuring. It also added a few more, such as amt_issued, is_kangaroo, is_subordinated, payment_rank, is_covered, mty_typ, is_cd, sector and int_acc. Most of these I can find a logical argument for why they might be useful to be included in the model, therefore I will consider them.
+
+### Xgboost based Model
+Doing a brief cross-validated grid search to identify the best training hyperparameters.
+```{r}
+# Define the parameter grid for XGBoost
+param_grid <- expand.grid(
+  nrounds = c(10, 50),      # Number of boosting rounds
+  eta = c(0.01, 0.1, 0.2, 0.5),         # Learning rate
+  max_depth = c(2, 4, 6),        # Maximum depth of trees
+  min_child_weight = c(1, 3), 
+  gamma = c(0.1, 0.3, 0.5),
+  colsample_bytree = 1,
+  subsample = 1
+)
+
+# Set up cross-validation method
+cv <- trainControl(
+  method = "cv",              # k-fold cross-validation
+  number = 10                  
+)
+
+xgb_grid <- train( # grid search
+  X_train, y_train,
+  method = "xgbTree",         
+  trControl = cv,
+  tuneGrid = param_grid,
+  metric = "RMSE",
+  verbose = FALSE,
+  verbosity = 0
+)
+
+xgb_grid$results[order(xgb_grid$results$RMSE),] %>% head()
+```
+
+### Feature importance for Xgboost model
+```{r}
+best_model_xgb <- xgboost(data = X_train, label = y_train, max.depth = 2, eta = 0.5, gamma = 0.1, nrounds = 50, min_child_weight = 3, objective = "reg:squarederror", verbose=0)
+importance_matrix <- xgb.importance(model = best_model_xgb)
+xgb.plot.importance(importance_matrix = importance_matrix)
+```
+Using Xgboost to measure feature importance again tells us a very similar story, perhaps with the exception of mty_typ which it gives a lot of importance. However, this is also not inconsistent with the other models as they also indicated statistical significance for this variable.
+
+I will now fit one more linear model using the variables indicated as important by both Lasso and Xgboost, just as a baseline comparison to these two more sophisticated model. I will then compare all three on the out-of-sample test to get an indication of real-world performance.
+
+### Final LM
+```{r}
+X <- static_data_train %>% select(c(flt_spread, final_maturity, avg_num_rtg, mty_typ, issue_dt, amt_issued, is_subordinated, payment_rank, disc_mrgn_mid))
+
+best_model_lm <- lm(disc_mrgn_mid~.,data=X)
+summary(best_model_lm)
+```
+
+### Comparing performance of the three models on the out-of-sample test set
+```{r}
+# Preparing the test set
+X_test <- static_data_test %>% select(-disc_mrgn_mid) %>% data.matrix()
+X_test_lm <- static_data_test %>% select(c(flt_spread, final_maturity, avg_num_rtg, mty_typ, issue_dt, amt_issued, is_subordinated, payment_rank))
+# Make predictions
+lm_preds <- predict(best_model_lm, X_test_lm)
+lasso_preds <- predict(best_model_lasso, X_test)
+xgb_preds <- predict(best_model_xgb, X_test)
+
+lm_rmse <- RMSE(lm_preds, y_test)
+lasso_rmse <- RMSE(lasso_preds, y_test)
+xgb_rmse <- RMSE(xgb_preds, y_test)
+
+paste("Linear Regression RMSE:", lm_rmse)
+paste("Lasso Regression RMSE:", lasso_rmse)
+paste("XGBoost Regression RMSE:", xgb_rmse)
+```
+
+This looks pretty good overall, RMSE in the out-of-sample set is slightly higher than in the cross-validated training set for both Lasso (40 instead of 33) and XGboost (27 instead of 26). This is not too surprising and within the expected boundaries. What is perhaps slightly surprising is that simple linear regression is actually performing better than Lasso regression.
+
+### Making predictions for the 2 newly issued bonds
+I will now use the 3 models to make predictions for the FV spread for the newly issued bonds. Given that not all the information required is available in the description, I have used information from the other already issued bonds of the respective issuers to infer these missing data points. I would assume that things like credit ratings would not differ too much between different bonds from the same issuer. However, in a real-life scenario this would of course need to be checked specifically with the bond issuer.
+
+```{r}
+new_issues <- read_csv('new_issues_data.csv', show_col_types = FALSE) %>% select(-c(bond_to_eqy_ticker, id, issuer, basel_iii_designation, first_call_dt_issuance, bail_in_bond_designation)) # only keeping features we use in the model
+new_issues$final_maturity <- as.Date(new_issues$final_maturity, format = "%d/%m/%Y")
+new_issues$issue_dt <- as.Date(new_issues$issue_dt, format = "%d/%m/%Y")
+new_issues
+```
+```{r}
+lm_preds <- predict(best_model_lm, new_issues)
+new_issues <- new_issues %>% data.matrix()
+lasso_preds <- predict(best_model_lasso, new_issues)
+xgb_preds <- predict(best_model_xgb, new_issues)
+paste("LM pred: ", lm_preds, "Lasso pred: ", lasso_preds, "XGBoost pred: ", xgb_preds)
+```
+
+The three models indicate a FV spread range between 68 and 80bps above 3m BBSW for the ANZ bond, compared to spread at issuance of 86bps, and a FV spread range between 67 and 80bps above 3m BBSW for the TD bond, compared to spread at issuance of 105bps. This would indicate that both bonds are undervalued at issuance and we can expect a capital gain from purchasing them.
+
+### Summary and potential improvements
+Overall, I found the 'flt_spread', 'final_maturity', 'avg_num_rtg' (which is the combined numerical score based on all 5 credit rating variables), 'mty_typ' and 'issue_amt' features to be most useful in predicting disc_mrgn_mid, or the spread above 3m BBSW at which a bond traded. I used these to fit a multiple linear regression, a lasso regularised regression and a xgboost boosted tree regression classifier. All three models' out-of-sample performance was roughly comparable, with the xgboost one slightly outperforming the lasso and linear regression one with a RMSE prediction error of 27 compared to 33 and 40 for linear regression and lasso regression, respectively.
+
+I trained these models based on both static_data and snapshot_data, without using the historic spread data in historic_data. As mentioned before, this could be utilised to form additional features such as mean traded spread, sd of traded spread, average difference between traded spread and issue spread for each issuer or type of bond. It could also be used to infer traded spreads for bonds that have already matured, and thereby extended the dataset by another 200 observations or about 40%, which could increase model accuracy.
+
+In addition to this, additional modelling approaches, such as other types of GLMs (Ridge, Elastic Net), other types of boosted trees/ random forests or linear regressions with interaction effects or non-linear transformations to features could have been fitted had there been more time. Overall, I am quite happy with the 3 models presented however.
